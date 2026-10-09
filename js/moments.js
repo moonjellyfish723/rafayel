@@ -45,9 +45,14 @@
 
     // 优先从 localStorage 读取（Home 页的 homeSetGlobal 同步写入 localStorage，
     // 而 localforage 是异步的，可能存在竞态条件，所以 localStorage 更可靠）
-    const lsAvatar = localStorage.getItem('home_avatar_me');
+    // [BUGFIX] 存储不可用（无痕/禁用站点数据/配额异常）时读取容错，避免头像同步流程整体中断
+    let lsAvatar = null;
+    let lsProfile = null;
+    try {
+      lsAvatar = localStorage.getItem('home_avatar_me');
+      lsProfile = localStorage.getItem('profile_me');
+    } catch (e) {}
     if (lsAvatar) avatarUrl = lsAvatar;
-    const lsProfile = localStorage.getItem('profile_me');
     if (lsProfile) {
       try {
         const profile = JSON.parse(lsProfile);
@@ -3508,8 +3513,18 @@
     if (!file || !file.type.startsWith('image/')) return;
 
     const reader = new FileReader();
-    reader.onload = function(ev) {
-      const base64 = ev.target.result;
+    // [BUGFIX] 手机原图 base64 常达数 MB，直接持久化会撑爆 localStorage 配额（约 5MB）
+    //          并被静默丢弃 → 重开页面封面还原默认。此处与模块内其他图片一致先压缩。
+    reader.onload = async function(ev) {
+      let base64 = ev.target.result;
+      try {
+        const compressFn = (window.SafeStore && window.SafeStore.compressImage)
+          ? window.SafeStore.compressImage
+          : compressImage;
+        base64 = await compressFn(base64, COMPRESS_MAX_WIDTH, COMPRESS_QUALITY);
+      } catch (err) {
+        console.warn('[moments] 封面压缩失败，使用原图:', err);
+      }
       const container = document.getElementById('moments-container');
       if (container) {
         container.querySelector('#beautifyCoverPreview').src = base64;
@@ -3537,17 +3552,28 @@
       if (typeof homeSetGlobal === 'function') {
         homeSetGlobal('home_avatar_me', avatarPreview.dataset.base64);
       }
-      localStorage.setItem('home_avatar_me', avatarPreview.dataset.base64);
-      
+      // [BUGFIX] 头像为大体积 base64，改走容错存储，避免配额溢出抛异常中断保存
+      if (window.SafeStore) {
+        window.SafeStore.set('home_avatar_me', avatarPreview.dataset.base64);
+      } else {
+        try { localStorage.setItem('home_avatar_me', avatarPreview.dataset.base64); } catch(e) {}
+      }
+
       // 同步更新 Home 页的 profile_me
-      const profileStr = localStorage.getItem('profile_me');
+      const profileStr = window.SafeStore
+        ? window.SafeStore.get('profile_me')
+        : localStorage.getItem('profile_me');
       if (profileStr) {
         try {
           const profile = JSON.parse(profileStr);
           profile.avatar = avatarPreview.dataset.base64;
           if (name) profile.name = name;
           if (signature) profile.signature = signature;
-          localStorage.setItem('profile_me', JSON.stringify(profile));
+          if (window.SafeStore) {
+            window.SafeStore.set('profile_me', JSON.stringify(profile));
+          } else {
+            localStorage.setItem('profile_me', JSON.stringify(profile));
+          }
           if (typeof homeSetGlobal === 'function') {
             homeSetGlobal('profile_me', JSON.stringify(profile));
           }
@@ -3557,7 +3583,14 @@
     if (coverPreview && coverPreview.dataset.base64) {
       userConfig.coverImage = coverPreview.dataset.base64;
       // 持久化封面背景
-      localStorage.setItem('moments_cover', coverPreview.dataset.base64);
+      // [BUGFIX] 封面尺寸大，改为写 IndexedDB，彻底规避 localStorage 配额限制
+      if (window.SafeStore) {
+        await window.SafeStore.setLarge('moments_cover', coverPreview.dataset.base64);
+      } else {
+        try {
+          localStorage.setItem('moments_cover', coverPreview.dataset.base64);
+        } catch(e) {}
+      }
     }
     
     await initUserInfo();
