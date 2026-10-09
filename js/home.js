@@ -13,7 +13,15 @@
 
     // ========== 主页绑定会话存储路由 ==========
     // 开关状态始终全局存储（不随会话变化）
-    let homeSessionBindEnabled = localStorage.getItem('home_session_bind') === 'true';
+    // [BUGFIX] 存储不可用（无痕模式/禁用站点数据）时不能抛异常，否则整个 home 模块初始化中断
+    let homeSessionBindEnabled = false;
+    try {
+        homeSessionBindEnabled = window.SafeStore
+            ? window.SafeStore.get('home_session_bind') === 'true'
+            : localStorage.getItem('home_session_bind') === 'true';
+    } catch (e) {
+        homeSessionBindEnabled = false;
+    }
 
     /**
      * 获取 Home 存储键名
@@ -28,52 +36,75 @@
     }
 
     /** 读取 Home 设置（自动路由） */
+    // [BUGFIX] 统一走 SafeStore，避免存储异常直接抛出
     function homeGetItem(key) {
-        return localStorage.getItem(homeKey(key));
+        const k = homeKey(key);
+        if (window.SafeStore) return window.SafeStore.get(k);
+        try { return localStorage.getItem(k); } catch (e) { return null; }
     }
 
     /** 写入 Home 设置（自动路由） */
+    // [BUGFIX] 配额不足时自动清理临时键重试，仍失败则降级写入 IndexedDB，绝不抛出
     function homeSetItem(key, value) {
-        localStorage.setItem(homeKey(key), value);
+        const k = homeKey(key);
+        if (window.SafeStore) return window.SafeStore.set(k, value);
+        try { localStorage.setItem(k, value); } catch (e) {}
     }
 
     /** 读取大容量设置（优先 localforage，回退 localStorage） */
     async function homeGetLargeItem(key) {
         const k = homeKey(key);
-        if (typeof localforage !== 'undefined') {
-            const val = await localforage.getItem(k);
-            if (val !== null) return val;
+        if (window.SafeStore) {
+            const v = await window.SafeStore.getAsync(k);
+            if (v !== null && v !== undefined && v !== '') return v;
         }
-        return localStorage.getItem(k);
+        if (typeof localforage !== 'undefined') {
+            try {
+                const val = await localforage.getItem(k);
+                if (val !== null) return val;
+            } catch (e) {}
+        }
+        return homeGetItem(key);
     }
 
     /** 写入大容量设置（使用 localforage） */
     function homeSetLargeItem(key, value) {
+        const k = homeKey(key);
+        if (window.SafeStore) return window.SafeStore.setLarge(k, value);
         if (typeof localforage !== 'undefined') {
-            return localforage.setItem(homeKey(key), value);
+            return localforage.setItem(k, value);
         }
-        localStorage.setItem(homeKey(key), value);
+        try { localStorage.setItem(k, value); } catch (e) {}
         return Promise.resolve();
     }
 
     /** 删除 Home 设置（自动路由） */
     function homeRemoveItem(key) {
-        localStorage.removeItem(homeKey(key));
+        const k = homeKey(key);
+        if (window.SafeStore) return window.SafeStore.remove(k);
+        try { localStorage.removeItem(k); } catch (e) {}
     }
 
     /** 读取全局 Home 设置（不受开关影响） */
     function homeGetGlobal(key) {
-        return localStorage.getItem(key);
+        if (window.SafeStore) return window.SafeStore.get(key);
+        try { return localStorage.getItem(key); } catch (e) { return null; }
     }
 
     /** 写入全局 Home 设置（不受开关影响） */
     function homeSetGlobal(key, value) {
         // 同时写入 localStorage 和 localforage，确保各模块都能读取
-        try {
-            localStorage.setItem(key, value);
-        } catch(e) {}
-        if (typeof localforage !== 'undefined') {
-            localforage.setItem(key, value).catch(() => {});
+        // [BUGFIX] 原实现虽已 try/catch，但配额失败后各模块同步读取会读到 null；
+        //          现统一走 SafeStore：清理临时键重试 → 降级 IndexedDB → 下次启动回填
+        if (window.SafeStore) {
+            window.SafeStore.set(key, value);
+        } else {
+            try {
+                localStorage.setItem(key, value);
+            } catch(e) {}
+            if (typeof localforage !== 'undefined') {
+                localforage.setItem(key, value).catch(() => {});
+            }
         }
         // 派发事件，通知其他模块数据已更新
         window.dispatchEvent(new CustomEvent('homeGlobalUpdated', { detail: { key, value } }));
@@ -467,16 +498,19 @@
         if (!file) return;
 
         const reader = new FileReader();
-        reader.onload = function(e) {
+        // [BUGFIX] 自定义页面背景为原始图片 base64，体积可达数 MB，直接写 localStorage 会
+        //          超出配额并抛 QuotaExceededError，中断后续保存 → 重开页面即还原默认。
+        //          这里改为与大容量存储（IndexedDB）对齐写入，并在写入后回写标记。
+        reader.onload = async function(e) {
             const url = e.target.result;
             const bgValue = `url(${url}) center/cover no-repeat`;
             const pageBg = document.getElementById('home-page-bg');
             if (pageBg) pageBg.style.background = bgValue;
 
             document.querySelectorAll('#page-bg-presets .bg-preset').forEach(el => el.classList.remove('active'));
-            homeSetItem('home_page_bg_custom', url);
+            await homeSetLargeItem('home_page_bg_custom', url);
             homeSetItem('home_page_bg', 'custom');
-            
+
             // 同步到聊天界面
             syncBgToChat(bgValue);
         };
@@ -495,7 +529,8 @@
         }
         
         // 获取当前自定义背景URL
-        let savedCustomUrl = homeGetItem('home_page_bg_custom');
+        // [BUGFIX] 自定义背景已改为大容量存储，需异步读取
+        let savedCustomUrl = await homeGetLargeItem('home_page_bg_custom');
         if (!savedCustomUrl && currentBg.includes('url(')) {
             const match = currentBg.match(/url\(["']?([^"')]+)["']?\)/);
             if (match) savedCustomUrl = match[1];
@@ -730,7 +765,14 @@
 
     // ========== 头像设置 ==========
     // 立即从 localStorage 读取，避免在 loadSavedSettings 之前使用默认值
-    let avatarSyncEnabled = localStorage.getItem('home_avatar_sync') !== 'false';
+    // [BUGFIX] 存储不可用（无痕/禁用站点数据）时 localStorage 访问会抛 SecurityError；
+    //          此处位于模块顶层，未捕获将中断 home 模块后续全部初始化（自定义面板/上传/预设等全失效）
+    let avatarSyncEnabled = true;
+    try {
+        avatarSyncEnabled = localStorage.getItem('home_avatar_sync') !== 'false';
+    } catch (e) {
+        avatarSyncEnabled = true;
+    }
     window._getAvatarSyncEnabled = () => avatarSyncEnabled;
 
     window.toggleAvatarSync = function() {
@@ -744,7 +786,13 @@
 
     // ========== 背景绑定设置 ==========
     // 立即从 localStorage 读取，避免在 loadSavedSettings 之前使用默认值
-    let bgSyncEnabled = localStorage.getItem('home_bg_sync') !== 'false';
+    // [BUGFIX] 同 avatarSyncEnabled：顶层读取必须容错，否则中断 home 模块后续初始化
+    let bgSyncEnabled = true;
+    try {
+        bgSyncEnabled = localStorage.getItem('home_bg_sync') !== 'false';
+    } catch (e) {
+        bgSyncEnabled = true;
+    }
     window._getBgSyncEnabled = () => bgSyncEnabled;
 
     window.toggleBgSync = function() {
@@ -769,7 +817,8 @@
     window.toggleHomeSessionBind = function() {
         homeSessionBindEnabled = !homeSessionBindEnabled;
         // 全局存储开关状态（不随会话变化）
-        localStorage.setItem('home_session_bind', homeSessionBindEnabled ? 'true' : 'false');
+        // [BUGFIX] 写入容错：配额满/存储禁用时不应抛异常中断后续 UI 刷新
+        try { localStorage.setItem('home_session_bind', homeSessionBindEnabled ? 'true' : 'false'); } catch (e) {}
         const toggle = document.getElementById('home-session-bind-toggle');
         if (toggle) {
             toggle.classList.toggle('active', homeSessionBindEnabled);
@@ -1850,7 +1899,9 @@
         // 页面背景
         const savedPageBg = homeGetItem('home_page_bg');
         if (savedPageBg === 'custom') {
-            const customUrl = homeGetItem('home_page_bg_custom');
+            // [BUGFIX] 自定义背景为大容量存储，必须异步读取（原来同步读 localStorage 恒为 null，
+            //          导致重开页面后自定义背景直接丢失、回落到默认背景）
+            const customUrl = await homeGetLargeItem('home_page_bg_custom');
             if (customUrl) {
                 const pageBg = document.getElementById('home-page-bg');
                 if (pageBg) pageBg.style.background = `url(${customUrl}) center/cover no-repeat`;
