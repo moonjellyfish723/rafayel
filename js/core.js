@@ -648,7 +648,7 @@ function _backupCriticalData() {
 
         let payloadToStore = backupPayload;
         const msgSizeEstimate = messages.length * 500; 
-        if (msgSizeEstimate > 3 * 1024 * 1024) {
+        if (msgSizeEstimate > 512 * 1024) {
             payloadToStore = {
                 ...backupPayload,
                 messages: messages.slice(-200),
@@ -656,20 +656,40 @@ function _backupCriticalData() {
             };
         }
 
-        const json = JSON.stringify(payloadToStore);
+        let json = JSON.stringify(payloadToStore);
 
-        if (json.length > 4.5 * 1024 * 1024) {
-            const smallerPayload = {
+        // [BUGFIX] 备份体积上限由 4.5MB 收敛到 512KB。
+        //   原实现最多占用 4.5MB，而 Android Edge / Chrome 移动端 localStorage 配额仅约 5MB，
+        //   于是「紧急备份」几乎吃满配额，导致主页 / 朋友圈的自定义配置写入时抛出
+        //   QuotaExceededError 并被静默丢弃（重开页面即还原默认值）。
+        //   聊天数据在 IndexedDB(localforage) 中已有权威副本，此处仅作最后兜底，
+        //   无需占用大半配额，保存前若配额紧张则会优先让位于用户配置。
+        const BACKUP_MAX_CHARS = 512 * 1024;
+        if (json.length > BACKUP_MAX_CHARS) {
+            const keepCount = Math.max(20, Math.floor(messages.length * BACKUP_MAX_CHARS / json.length));
+            payloadToStore = {
                 ...payloadToStore,
-                messages: messages.slice(-50),
+                messages: messages.slice(-keepCount),
                 _truncated: true
             };
-            const smallerJson = JSON.stringify(smallerPayload);
-            localStorage.setItem(_BACKUP_PREFIX + SESSION_ID + '_critical', smallerJson);
+            json = JSON.stringify(payloadToStore);
+        }
+        if (json.length > BACKUP_MAX_CHARS) {
+            payloadToStore = {
+                ...backupPayload,
+                messages: messages.slice(-20),
+                _truncated: true
+            };
+            json = JSON.stringify(payloadToStore);
+        }
+
+        if (window.SafeStore) {
+            window.SafeStore.set(_BACKUP_PREFIX + SESSION_ID + '_critical', json);
+            window.SafeStore.set(_BACKUP_PREFIX + SESSION_ID + '_timestamp', String(Date.now()));
         } else {
             localStorage.setItem(_BACKUP_PREFIX + SESSION_ID + '_critical', json);
+            localStorage.setItem(_BACKUP_PREFIX + SESSION_ID + '_timestamp', String(Date.now()));
         }
-        localStorage.setItem(_BACKUP_PREFIX + SESSION_ID + '_timestamp', String(Date.now()));
     } catch (e) {
         console.warn('localStorage 备份写入失败（可能存储已满）:', e);
     }
