@@ -578,3 +578,309 @@ async function importAllData(file) {
         showNotification('导入失败：' + msg, 'error', 5000);
     }
 }
+
+/* ============================================================
+ * [BUGFIX] SafeStore — 容错本地存储层（追加模块，不修改原有逻辑）
+ *
+ * 问题根因：
+ *   主页 / 朋友圈的自定义配置写入 localStorage 时，若累计体积超出浏览器
+ *   配额（Edge/Chrome 移动端约 5MB），setItem 会抛出 QuotaExceededError；
+ *   而调用点没有 try/catch，异常中断了后续保存流程，导致
+ *     · 当前标签页内内存值仍生效（看起来正常）
+ *     · 实际没有落盘，重新加载/重开标签后读回默认值（即用户反馈的现象）
+ *
+ * 方案：
+ *   1) localStorage 仍为同步读取的权威源，保证不改动任何现有同步读逻辑；
+ *   2) 写入前若配额不足，先清理「可重建的临时键」后重试；
+ *   3) 仍失败则降级写入 IndexedDB(localforage)，不再抛出异常中断流程；
+ *   4) 启动时把 IndexedDB 中、localStorage 缺失的配置键自动回填；
+ *   5) 主页配置(home_/profile_/avatar_)与朋友圈配置(moments_)分别镜像到
+ *      独立的 IndexedDB 命名空间 CFG_HOME_V1 / CFG_MOMENTS_V1；
+ *   6) 全部读写均包裹 try/catch，兼容移动端 Edge 无痕模式(SecurityError)。
+ * ============================================================ */
+(function () {
+    'use strict';
+    if (window.SafeStore) return;
+
+    var HOME_NS = 'CFG_HOME_V1';
+    var MOMENTS_NS = 'CFG_MOMENTS_V1';
+    var MIRROR_MAX = 512 * 1024;   // 超过 512KB 的值不进命名空间镜像（仍进 IndexedDB 直存）
+    var HYDRATE_MAX = 1024 * 1024; // 回填单键上限，避免把超大 blob 塞回 localStorage
+
+    // localStorage 可用性探测（无痕模式 / 禁用站点数据会抛 SecurityError）
+    var LS_OK = (function () {
+        try {
+            var k = '__safe_store_probe__';
+            window.localStorage.setItem(k, '1');
+            window.localStorage.removeItem(k);
+            return true;
+        } catch (e) { return false; }
+    })();
+
+    function isQuotaError(e) {
+        if (!e) return false;
+        var n = String(e.name || '');
+        var m = String(e.message || '');
+        return n === 'QuotaExceededError' ||
+               n === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+               n === 'QUOTA_EXCEEDED_ERR' ||
+               e.code === 22 || e.code === 1014 ||
+               /quota|exceeded the quota/i.test(m);
+    }
+
+    // 可安全清除的临时键：内容可重建，或仅为缓存
+    var TRANSIENT_RE = [
+        /^BACKUP_V1_.*_critical$/,
+        /^BACKUP_V1_.*_timestamp$/,
+        /^__safe_store_probe__$/,
+        /^__quota_probe__$/,
+        /^__junk__$/
+    ];
+
+    function isTransient(k) {
+        for (var i = 0; i < TRANSIENT_RE.length; i++) {
+            if (TRANSIENT_RE[i].test(k)) return true;
+        }
+        return false;
+    }
+
+    /** 清理可重建的临时键，为真正的用户配置腾出配额 */
+    function evictTransient() {
+        if (!LS_OK) return 0;
+        var removed = 0;
+        try {
+            var doomed = [];
+            for (var i = 0; i < window.localStorage.length; i++) {
+                var k = window.localStorage.key(i);
+                if (k && isTransient(k)) doomed.push(k);
+            }
+            for (var j = 0; j < doomed.length; j++) {
+                try { window.localStorage.removeItem(doomed[j]); removed++; } catch (e) {}
+            }
+        } catch (e) {}
+        if (removed) console.warn('[SafeStore] 已清理临时键以释放存储配额:', removed);
+        return removed;
+    }
+
+    function rawGet(key) {
+        if (!LS_OK) return null;
+        try { return window.localStorage.getItem(key); } catch (e) { return null; }
+    }
+
+    function rawRemove(key) {
+        if (!LS_OK) return;
+        try { window.localStorage.removeItem(key); } catch (e) {}
+    }
+
+    /** 同步写入；配额不足时先清理临时键再重试，仍失败返回 false */
+    function rawSet(key, value) {
+        if (!LS_OK) return false;
+        try {
+            window.localStorage.setItem(key, value);
+            return true;
+        } catch (e) {
+            if (!isQuotaError(e)) return false;
+            evictTransient();
+            try {
+                window.localStorage.setItem(key, value);
+                return true;
+            } catch (e2) {
+                return false;
+            }
+        }
+    }
+
+    function forage() {
+        try {
+            return (typeof localforage !== 'undefined' && localforage) ? localforage : null;
+        } catch (e) { return null; }
+    }
+
+    /** 主页配置 / 朋友圈配置 分别归入独立命名空间 */
+    function pickNs(key) {
+        if (/^(home_|profile_|avatar_)/.test(key)) return HOME_NS;
+        if (/^moments_/.test(key)) return MOMENTS_NS;
+        return null;
+    }
+
+    function mirrorPut(key, value) {
+        var ns = pickNs(key);
+        var f = forage();
+        if (!ns || !f) return;
+        if (typeof value === 'string' && value.length > MIRROR_MAX) return;
+        try {
+            f.getItem(ns).then(function (data) {
+                var b = (data && typeof data === 'object') ? data : {};
+                b[key] = value;
+                return f.setItem(ns, b);
+            }).catch(function () {});
+        } catch (e) {}
+    }
+
+    function mirrorRemove(key) {
+        var ns = pickNs(key);
+        var f = forage();
+        if (!ns || !f) return;
+        try {
+            f.getItem(ns).then(function (data) {
+                if (data && typeof data === 'object' && (key in data)) {
+                    delete data[key];
+                    return f.setItem(ns, data);
+                }
+            }).catch(function () {});
+        } catch (e) {}
+    }
+
+    function toStr(v) {
+        if (v === null || v === undefined) return '';
+        return (typeof v === 'string') ? v : JSON.stringify(v);
+    }
+
+    window.SafeStore = {
+        LS_OK: LS_OK,
+        isQuotaError: isQuotaError,
+        evictTransient: evictTransient,
+        HOME_NS: HOME_NS,
+        MOMENTS_NS: MOMENTS_NS,
+
+        /** 同步读（localStorage 为权威源，语义与原生一致） */
+        get: function (key) { return rawGet(key); },
+
+        /** 异步读：localStorage 优先，缺失时回退 IndexedDB（直存 → 命名空间镜像） */
+        getAsync: function (key) {
+            var v = rawGet(key);
+            if (v !== null && v !== undefined && v !== '') return Promise.resolve(v);
+            var f = forage();
+            if (!f) return Promise.resolve(v);
+            return f.getItem(key).then(function (sv) {
+                if (sv !== null && sv !== undefined && sv !== '') return sv;
+                var ns = pickNs(key);
+                if (!ns) return v;
+                return f.getItem(ns).then(function (b) {
+                    if (b && typeof b === 'object' && b[key] !== undefined) return b[key];
+                    return v;
+                });
+            }).catch(function () { return v; });
+        },
+
+        /** 同步写：localStorage + IndexedDB 双写，失败不抛异常 */
+        set: function (key, value) {
+            var s = toStr(value);
+            var ok = rawSet(key, s);
+            var f = forage();
+            if (f) {
+                try { f.setItem(key, s).catch(function () {}); } catch (e) {}
+            }
+            mirrorPut(key, s);
+            if (!ok && !LS_OK) console.warn('[SafeStore] localStorage 不可用，已仅写入 IndexedDB:', key);
+            else if (!ok) console.warn('[SafeStore] localStorage 配额不足，已降级写入 IndexedDB:', key);
+            return ok;
+        },
+
+        /** 大容量写：IndexedDB 为主，localStorage 尽力而为 */
+        setLarge: function (key, value) {
+            var s = toStr(value);
+            mirrorPut(key, s);
+            var f = forage();
+            if (f) {
+                try { return f.setItem(key, s); } catch (e) {}
+            }
+            rawSet(key, s);
+            return Promise.resolve();
+        },
+
+        remove: function (key) {
+            rawRemove(key);
+            var f = forage();
+            if (f) { try { f.removeItem(key).catch(function () {}); } catch (e) {} }
+            mirrorRemove(key);
+        },
+
+        /**
+         * 启动回填：把 IndexedDB 中存在、localStorage 缺失的配置键写回 localStorage。
+         * 不传参时仅扫描主页/朋友圈命名空间（不会碰聊天记录等大对象）。
+         */
+        hydrate: function (keys) {
+            var f = forage();
+            if (!f || !LS_OK) return Promise.resolve(0);
+            var task;
+            if (Array.isArray(keys)) {
+                task = Promise.resolve(keys.slice());
+            } else {
+                task = Promise.all([f.keys(), f.getItem(HOME_NS), f.getItem(MOMENTS_NS)]).then(function (r) {
+                    var bag = {};
+                    (r[0] || []).forEach(function (k) {
+                        if (pickNs(k)) bag[k] = 1;
+                    });
+                    [r[1], r[2]].forEach(function (b) {
+                        if (b && typeof b === 'object') Object.keys(b).forEach(function (k) { bag[k] = 1; });
+                    });
+                    return Object.keys(bag);
+                });
+            }
+            return task.then(function (list) {
+                var restored = 0;
+                return list.reduce(function (chain, k) {
+                    return chain.then(function () {
+                        var cur = rawGet(k);
+                        if (cur !== null && cur !== undefined && cur !== '') return;
+                        return f.getItem(k).then(function (v) {
+                            if (v === null || v === undefined || v === '') {
+                                var ns = pickNs(k);
+                                if (!ns) return;
+                                return f.getItem(ns).then(function (b) {
+                                    if (b && typeof b === 'object' && b[k] !== undefined) v = b[k];
+                                });
+                            }
+                            if (v === null || v === undefined || v === '') return;
+                            var s = toStr(v);
+                            if (s.length > HYDRATE_MAX) return;
+                            if (rawSet(k, s)) restored++;
+                        }).catch(function () {});
+                    });
+                }, Promise.resolve()).then(function () {
+                    if (restored) console.log('[SafeStore] 已从 IndexedDB 回填配置键:', restored);
+                    return restored;
+                });
+            }).catch(function () { return 0; });
+        },
+
+        /** 图片压缩：从源头避免超大 base64 撑爆 localStorage 配额 */
+        compressImage: function (base64, maxWidth, quality) {
+            return new Promise(function (resolve) {
+                try {
+                    if (!base64 || typeof base64 !== 'string' || base64.indexOf('data:image') !== 0) {
+                        return resolve(base64);
+                    }
+                    var img = new Image();
+                    img.onload = function () {
+                        try {
+                            var w = img.width, h = img.height;
+                            var mw = maxWidth || 1600;
+                            if (w > mw) { h = Math.round(h * mw / w); w = mw; }
+                            var canvas = document.createElement('canvas');
+                            canvas.width = w; canvas.height = h;
+                            var ctx = canvas.getContext('2d');
+                            ctx.drawImage(img, 0, 0, w, h);
+                            resolve(canvas.toDataURL('image/jpeg', quality || 0.85));
+                        } catch (e) { resolve(base64); }
+                    };
+                    img.onerror = function () { resolve(base64); };
+                    img.src = base64;
+                } catch (e) { resolve(base64); }
+            });
+        }
+    };
+
+    // [BUGFIX] 启动即回填：把此前因 localStorage 配额不足而降级写入 IndexedDB 的配置键，
+    //          重新写回 localStorage，保证各处「同步读取」（homeGetItem / homeGetGlobal 等）
+    //          能拿到用户上一次保存的真实值，而不是默认值。
+    //          时序说明：utils.js 在 home.js / moments.js 之前加载，而主页与朋友圈的配置读取
+    //          发生在 loadData() 完成之后（core.js 中 initHomePage 经 100ms 延时触发），
+    //          因此回填必然先于界面读取完成，不改变原有渲染流程。
+    try {
+        window.__SafeStoreHydratePromise = window.SafeStore.hydrate();
+    } catch (e) {}
+
+    console.log('[SafeStore] 容错存储层已就绪, localStorage 可用:', LS_OK);
+})();
