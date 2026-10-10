@@ -1,92 +1,125 @@
 /* ============================================================
- * 珊屿蝶梦🦋 PWA Service Worker
- * 仅新增 PWA 能力：离线缓存兜底 + 通知悬浮显示 + 推送事件预留
- * 不改变站点原有任何行为（fetch 走网络优先，正常访问不受影响）
+ * 珊屿蝶梦🦋 PWA Service Worker (sw.js)
+ * 部署要求（GitHub Pages）：
+ *   1. sw.js 必须放在仓库根目录，与 index.html 同级；
+ *      否则注册作用域会被限制在子目录，无法拦截全站请求。
+ *   2. GitHub Pages 强制 HTTPS，PWA 与 Push 均要求 HTTPS。
  * ============================================================ */
-var CACHE_NAME = 'rafayel-pwa-v1';
-var CORE_ASSETS = ['./', './index.html', './manifest.json'];
 
-self.addEventListener('install', function (event) {
-  self.skipWaiting();
+const VERSION = 'v1.0.0';
+const CACHE_NAME = `rafayel-pwa-${VERSION}`;
+
+/* 预缓存核心资源（路径全部使用相对仓库根的写法，兼容子路径部署） */
+const PRECACHE_URLS = [
+  './',
+  './index.html',
+  './manifest.json',
+  './icon-192.png',
+  './icon-512.png'
+];
+
+/* ---------- 安装：预缓存 ---------- */
+self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then(function (cache) {
-      return cache.addAll(CORE_ASSETS);
-    }).catch(function () { /* 首装缓存失败不阻塞激活 */ })
+    caches.open(CACHE_NAME)
+      .then((cache) => cache.addAll(PRECACHE_URLS))
+      .then(() => self.skipWaiting()) // 新 SW 立即接管
   );
 });
 
-self.addEventListener('activate', function (event) {
+/* ---------- 激活：清理旧版本缓存 ---------- */
+self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then(function (keys) {
-      return Promise.all(
-        keys.filter(function (k) { return k !== CACHE_NAME; })
-            .map(function (k) { return caches.delete(k); })
-      );
-    }).then(function () { return self.clients.claim(); })
+    caches.keys()
+      .then((keys) =>
+        Promise.all(
+          keys
+            .filter((key) => key !== CACHE_NAME)
+            .map((key) => caches.delete(key))
+        )
+      )
+      .then(() => self.clients.claim()) // 立即控制所有已打开的页面
   );
 });
 
-/* 网络优先，离线时回退缓存 —— 正常访问完全不干预，纯新增兜底能力 */
-self.addEventListener('fetch', function (event) {
-  var req = event.request;
-  if (req.method !== 'GET') { return; }
+/* ---------- 请求拦截：缓存策略 ----------
+ * - 导航 / HTML 请求：网络优先，失败回退缓存（保证内容更新）
+ * - 静态资源：缓存优先，失败回退网络（保证离线可用）
+ * - 跨域请求（如外部图床）：不拦截
+ */
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  if (req.method !== 'GET') return;
+
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+
+  if (req.mode === 'navigate' || url.pathname.endsWith('/index.html')) {
+    event.respondWith(
+      fetch(req)
+        .then((res) => {
+          const copy = res.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
+          return res;
+        })
+        .catch(() =>
+          caches.match(req).then((r) => r || caches.match('./index.html'))
+        )
+    );
+    return;
+  }
+
   event.respondWith(
-    fetch(req).then(function (res) {
-      if (res && res.ok && res.type === 'basic') {
-        var copy = res.clone();
-        caches.open(CACHE_NAME).then(function (cache) { cache.put(req, copy); }).catch(function () {});
-      }
-      return res;
-    }).catch(function () {
-      return caches.match(req).then(function (hit) {
-        return hit || caches.match('./index.html');
+    caches.match(req).then((cached) => {
+      if (cached) return cached;
+      return fetch(req).then((res) => {
+        const copy = res.clone();
+        caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
+        return res;
       });
     })
   );
 });
 
-/* 推送事件：预留给未来服务端 Web Push；收到即显示悬浮通知 */
-self.addEventListener('push', function (event) {
-  var data = {};
-  try { data = event.data ? event.data.json() : {}; } catch (e) { /* 忽略非 JSON */ }
-  var title = data.title || '珊屿蝶梦';
-  var options = {
-    body: data.body || '',
-    icon: './icons/icon-192.png',
-    badge: './icons/icon-192.png',
-    requireInteraction: true,
-    vibrate: [200, 100, 200],
-    tag: data.tag || 'rafayel-notify'
+/* ---------- 推送通知：收到 push 后显示悬浮通知 ---------- */
+self.addEventListener('push', (event) => {
+  let payload = {};
+  try {
+    payload = event.data ? event.data.json() : {};
+  } catch (e) {
+    payload = { body: event.data ? event.data.text() : '' };
+  }
+
+  const title = payload.title || '珊屿蝶梦🦋';
+  const options = {
+    body: payload.body || '你有一条新消息',
+    icon: payload.icon || './icon-192.png',
+    badge: './icon-192.png',
+    tag: payload.tag || 'rafayel-push',
+    renotify: true,
+    data: payload.url || './index.html',
+    vibrate: [100, 50, 100],
+    requireInteraction: false // 悬浮展示即可，无需强制驻留
   };
+
   event.waitUntil(self.registration.showNotification(title, options));
 });
 
-/* 点击通知：聚焦已打开的窗口，否则打开站点首页 */
-self.addEventListener('notificationclick', function (event) {
+/* ---------- 点击通知：聚焦已有窗口，否则打开站点首页 ---------- */
+self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  event.waitUntil(
-    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (list) {
-      for (var i = 0; i < list.length; i++) {
-        if ('focus' in list[i]) { return list[i].focus(); }
-      }
-      return self.clients.openWindow('./index.html');
-    })
-  );
-});
+  const targetUrl = event.notification.data || './index.html';
 
-/* 页面消息：页面请求授权后，经由 SW 显示系统级悬浮通知 */
-self.addEventListener('message', function (event) {
-  var msg = event.data || {};
-  if (msg.type === 'notify') {
-    var title = msg.title || '珊屿蝶梦';
-    var options = {
-      body: msg.body || '',
-      icon: './icons/icon-192.png',
-      badge: './icons/icon-192.png',
-      requireInteraction: true,
-      vibrate: [200, 100, 200],
-      tag: msg.tag || 'rafayel-notify'
-    };
-    event.waitUntil(self.registration.showNotification(title, options));
-  }
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true })
+      .then((clientList) => {
+        for (const client of clientList) {
+          if ('focus' in client) {
+            client.focus();
+            return;
+          }
+        }
+        return self.clients.openWindow(targetUrl);
+      })
+  );
 });

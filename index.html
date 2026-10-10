@@ -17,6 +17,13 @@
     <link rel="icon" type="image/png" sizes="192x192" href="https://file.youtochat.com/images/20260216/1771224856844_qdqqd.jpeg">
     <link rel="apple-touch-icon" href="https://file.youtochat.com/images/20260216/1771224856844_qdqqd.jpeg">
     <meta name="apple-mobile-web-app-title" content="ʚ𝑳𝑶𝑽𝑬ɞ">
+    <!-- ===== PWA 增强（新增，不影响原有代码） ===== -->
+    <link rel="manifest" href="manifest.json">
+    <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+    <link rel="icon" type="image/png" sizes="512x512" href="icon-512.png">
+    <link rel="apple-touch-icon" href="icon-192.png">
+    <meta name="application-name" content="珊屿蝶梦🦋">
+    <!-- ===== PWA 增强 END ===== -->
     <script>
         // 确保 applyTheme 可用
         window.applyTheme = window.applyTheme || function(name) {
@@ -4636,5 +4643,38 @@
             <button class="spark-modal-close" onclick="SparkApp.closeSparkModal()">知道了</button>
         </div>
     </div>
+
+    <!-- ===== PWA Service Worker 注册与推送订阅（新增，不影响原有功能） ===== -->
+    <script>
+        (function () {
+            if (!('serviceWorker' in navigator)) return;
+            window.addEventListener('load', function () {
+                navigator.serviceWorker.register('sw.js')
+                    .then(function (reg) {
+                        console.log('PWA: Service Worker 注册成功, scope =', reg.scope);
+                        // 请求通知权限并尝试推送订阅（无 VAPID 公钥时订阅会失败，仅提示不阻塞）
+                        if ('Notification' in window && 'PushManager' in window) {
+                            Notification.requestPermission().then(function (perm) {
+                                if (perm === 'granted') {
+                                    reg.pushManager.getSubscription().then(function (sub) {
+                                        if (sub) return sub;
+                                        return reg.pushManager.subscribe({
+                                            userVisibleOnly: true
+                                        });
+                                    }).then(function (sub) {
+                                        console.log('PWA: 推送订阅成功', sub.endpoint);
+                                    }).catch(function (err) {
+                                        console.warn('PWA: 推送订阅需要配置 VAPID 公钥后生效', err);
+                                    });
+                                }
+                            });
+                        }
+                    })
+                    .catch(function (err) {
+                        console.warn('PWA: Service Worker 注册失败', err);
+                    });
+            });
+        })();
+    </script>
 </body>
 </html>
